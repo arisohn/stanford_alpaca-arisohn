@@ -24,7 +24,7 @@ from torch.utils.data import Dataset
 import json
 import os
 import io
-from trl import SFTTrainer, SFTConfig
+from trl import SFTTrainer, SFTConfig, DataCollatorForCompletionOnlyLM
 from datasets import Dataset as HFDataset
 
 IGNORE_INDEX = -100
@@ -142,28 +142,41 @@ def train():
         output = example['output']
         
         if input_text != "":
-            text = PROMPT_DICT["prompt_input"].format_map({
+            prompt = PROMPT_DICT["prompt_input"].format_map({
                 "instruction": instruction,
                 "input": input_text
-            }) + output + tokenizer.eos_token
+            })
         else:
-            text = PROMPT_DICT["prompt_no_input"].format_map({
+            prompt = PROMPT_DICT["prompt_no_input"].format_map({
                 "instruction": instruction
-            }) + output + tokenizer.eos_token
-            
-        formatted_texts.append(text)
+            })
+        
+        # Store full text for SFTTrainer
+        full_text = prompt + output + tokenizer.eos_token
+        formatted_texts.append(full_text)
     
-    # Convert to HuggingFace Dataset
+    # Convert to HuggingFace Dataset with only text field
     train_dataset = HFDataset.from_dict({"text": formatted_texts})
     
-    # Initialize SFTTrainer without DataCollatorForCompletionOnlyLM
-    # Let SFTTrainer handle the collation with its default behavior
+    # Create response template for DataCollatorForCompletionOnlyLM
+    # This will help identify where the response starts
+    response_template = "\n### Response:"
+    
+    # Initialize data collator to only compute loss on completion tokens
+    data_collator = DataCollatorForCompletionOnlyLM(
+        response_template=response_template,
+        tokenizer=tokenizer,
+        mlm=False
+    )
+    
+    # Initialize SFTTrainer with DataCollatorForCompletionOnlyLM
     trainer = SFTTrainer(
         model=model,
         processing_class=tokenizer,
         args=training_args,
         train_dataset=train_dataset,
         eval_dataset=None,
+        data_collator=data_collator,
     )
     
     trainer.train()
