@@ -8,6 +8,10 @@ import time
 import json
 from typing import Optional, Sequence, Union
 
+import tqdm
+import copy
+
+'''
 import openai
 import tqdm
 from openai import openai_object
@@ -128,6 +132,7 @@ def openai_completion(
         # Return non-tuple if only 1 input and 1 generation.
         (completions,) = completions
     return completions
+'''
 
 
 def _make_w_io_base(f, mode: str):

@@ -130,37 +130,33 @@ def train():
         model=model,
     )
 
-    # Use data processing from train.py
+    # Load data the same way as train.py
     logging.warning("Loading data...")
     list_data_dict = jload(data_args.data_path)
     
-    # Format data for TRL
+    # Format inputs the same way as train.py
+    logging.warning("Formatting inputs...")
+    prompt_input, prompt_no_input = PROMPT_DICT["prompt_input"], PROMPT_DICT["prompt_no_input"]
+    
+    # Build complete texts for SFTTrainer
     formatted_texts = []
     for example in list_data_dict:
-        instruction = example['instruction']
-        input_text = example.get('input', '')
-        output = example['output']
-        
-        if input_text != "":
-            prompt = PROMPT_DICT["prompt_input"].format_map({
-                "instruction": instruction,
-                "input": input_text
-            })
+        # Generate prompt using the same logic as train.py
+        if example.get("input", "") != "":
+            prompt = prompt_input.format_map(example)
         else:
-            prompt = PROMPT_DICT["prompt_no_input"].format_map({
-                "instruction": instruction
-            })
+            prompt = prompt_no_input.format_map(example)
         
-        # Store full text for SFTTrainer
-        full_text = prompt + output + tokenizer.eos_token
+        # Combine prompt with output and eos_token
+        full_text = prompt + example['output'] + tokenizer.eos_token
         formatted_texts.append(full_text)
     
-    # Convert to HuggingFace Dataset with only text field
+    # Convert to HuggingFace Dataset
     train_dataset = HFDataset.from_dict({"text": formatted_texts})
     
     # Create response template for DataCollatorForCompletionOnlyLM
     # This will help identify where the response starts
-    response_template = "\n### Response:"
+    response_template = "### Response:"
     
     # Initialize data collator to only compute loss on completion tokens
     data_collator = DataCollatorForCompletionOnlyLM(
