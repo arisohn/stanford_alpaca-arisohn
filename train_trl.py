@@ -12,20 +12,16 @@
 #    See the License for the specific language governing permissions and
 #    limitations under the License.
 
-import copy
 import logging
 from dataclasses import dataclass, field
-from typing import Dict, Optional, Sequence
+from typing import Dict, Optional, List
 
 import torch
 import transformers
-from utils import _make_r_io_base, jload
-from torch.utils.data import Dataset
-import json
-import os
-import io
-from trl import SFTTrainer, SFTConfig, DataCollatorForCompletionOnlyLM
-from datasets import Dataset as HFDataset
+import utils
+from transformers import AutoModelForCausalLM, AutoTokenizer
+from trl import SFTTrainer, DataCollatorForCompletionOnlyLM, SFTConfig
+from datasets import Dataset
 
 IGNORE_INDEX = -100
 DEFAULT_PAD_TOKEN = "[PAD]"
@@ -36,12 +32,12 @@ PROMPT_DICT = {
     "prompt_input": (
         "Below is an instruction that describes a task, paired with an input that provides further context. "
         "Write a response that appropriately completes the request.\n\n"
-        "### Instruction:\n{instruction}\n\n### Input:\n{input}\n\n### Response:"
+        "### Instruction:\n{instruction}\n\n### Input:\n{input}\n\n### Response:\n"
     ),
     "prompt_no_input": (
         "Below is an instruction that describes a task. "
         "Write a response that appropriately completes the request.\n\n"
-        "### Instruction:\n{instruction}\n\n### Response:"
+        "### Instruction:\n{instruction}\n\n### Response:\n"
     ),
 }
 
@@ -64,9 +60,6 @@ class TrainingArguments(SFTConfig):
         default=512,
         metadata={"help": "Maximum sequence length. Sequences will be right padded (and possibly truncated)."},
     )
-    dataset_text_field: str = field(default="text")
-    max_seq_length: Optional[int] = field(default=512)
-    packing: bool = field(default=False)
 
 
 def smart_tokenizer_and_embedding_resize(
@@ -92,28 +85,134 @@ def smart_tokenizer_and_embedding_resize(
         output_embeddings[-num_new_tokens:] = output_embeddings_avg
 
 
+def formatting_prompts_func(examples: Dict[str, List], tokenizer: transformers.PreTrainedTokenizer) -> List[str]:
+    """Format the dataset for SFTTrainer."""
+    # Handle both single example and batched examples
+    if isinstance(examples["instruction"], str):
+        # Single example case
+        instruction = examples["instruction"]
+        input_text = examples.get("input", "")
+        output = examples["output"]
+        
+        if input_text:
+            prompt = PROMPT_DICT["prompt_input"].format_map({
+                "instruction": instruction,
+                "input": input_text
+            })
+        else:
+            prompt = PROMPT_DICT["prompt_no_input"].format_map({
+                "instruction": instruction
+            })
+        
+        # Tokenize prompt to check if we have room for output
+        prompt_tokens = tokenizer(prompt, truncation=False, return_tensors=None)
+        prompt_length = len(prompt_tokens["input_ids"])
+        
+        # Reserve space for output and EOS token
+        max_output_length = tokenizer.model_max_length - prompt_length - 1
+        
+        if max_output_length > 50:  # Ensure minimum output space
+            # Truncate output if needed
+            output_tokens = tokenizer(output, truncation=False, return_tensors=None)
+            if len(output_tokens["input_ids"]) > max_output_length:
+                # Truncate output to fit
+                truncated_output_ids = output_tokens["input_ids"][:max_output_length]
+                output = tokenizer.decode(truncated_output_ids, skip_special_tokens=True)
+            
+            text = prompt + output + tokenizer.eos_token
+            return text
+        else:
+            logging.warning(f"Skipping example - prompt too long ({prompt_length} tokens)")
+            # Return minimal valid example to avoid error
+            return "### Instruction:\nHello\n\n### Response:\nHi" + tokenizer.eos_token
+    else:
+        # Batched examples case
+        output_texts = []
+        prompt_input = PROMPT_DICT["prompt_input"]
+        prompt_no_input = PROMPT_DICT["prompt_no_input"]
+        
+        for i in range(len(examples["instruction"])):
+            # Handle missing or empty input field
+            if "input" in examples and i < len(examples["input"]):
+                input_text = examples["input"][i] if examples["input"][i] else ""
+            else:
+                input_text = ""
+            
+            if input_text:
+                prompt = prompt_input.format_map({
+                    "instruction": examples["instruction"][i],
+                    "input": input_text
+                })
+            else:
+                prompt = prompt_no_input.format_map({
+                    "instruction": examples["instruction"][i]
+                })
+            
+            # Tokenize prompt to check if we have room for output
+            prompt_tokens = tokenizer(prompt, truncation=False, return_tensors=None)
+            prompt_length = len(prompt_tokens["input_ids"])
+            
+            # Reserve space for output and EOS token
+            max_output_length = tokenizer.model_max_length - prompt_length - 1
+            
+            if max_output_length > 50:  # Ensure minimum output space
+                output = examples["output"][i]
+                # Truncate output if needed
+                output_tokens = tokenizer(output, truncation=False, return_tensors=None)
+                if len(output_tokens["input_ids"]) > max_output_length:
+                    # Truncate output to fit
+                    truncated_output_ids = output_tokens["input_ids"][:max_output_length]
+                    output = tokenizer.decode(truncated_output_ids, skip_special_tokens=True)
+                
+                text = prompt + output + tokenizer.eos_token
+                output_texts.append(text)
+            else:
+                logging.warning(f"Skipping example {i} - prompt too long ({prompt_length} tokens)")
+        
+        # Always return at least one valid example to avoid empty batch error
+        if not output_texts:
+            output_texts.append("### Instruction:\nHello\n\n### Response:\nHi" + tokenizer.eos_token)
+        
+        return output_texts
+
+
+def load_dataset_from_json(data_path: str) -> Dataset:
+    """Load dataset from JSON file and convert to HuggingFace Dataset."""
+    logging.warning("Loading data...")
+    list_data_dict = utils.jload(data_path)
+    
+    # Convert list of dicts to dict of lists for Dataset
+    dataset_dict = {
+        "instruction": [d.get("instruction", "") for d in list_data_dict],
+        "input": [d.get("input", "") for d in list_data_dict],
+        "output": [d.get("output", "") for d in list_data_dict]
+    }
+    
+    return Dataset.from_dict(dataset_dict)
 
 
 def train():
     parser = transformers.HfArgumentParser((ModelArguments, DataArguments, TrainingArguments))
     model_args, data_args, training_args = parser.parse_args_into_dataclasses()
-    
-    # Set max_seq_length from model_max_length if not specified
-    if training_args.max_seq_length is None:
-        training_args.max_seq_length = training_args.model_max_length
 
-    model = transformers.AutoModelForCausalLM.from_pretrained(
+    # Load model
+    model = AutoModelForCausalLM.from_pretrained(
         model_args.model_name_or_path,
         cache_dir=training_args.cache_dir,
+        torch_dtype=torch.float16 if torch.cuda.is_available() and training_args.fp16 else torch.float32,
+        device_map="auto" if torch.cuda.is_available() else None,
     )
 
-    tokenizer = transformers.AutoTokenizer.from_pretrained(
+    # Load tokenizer
+    tokenizer = AutoTokenizer.from_pretrained(
         model_args.model_name_or_path,
         cache_dir=training_args.cache_dir,
         model_max_length=training_args.model_max_length,
         padding_side="right",
         use_fast=False,
     )
+    
+    # Set special tokens
     special_tokens_dict = dict()
     if tokenizer.pad_token is None:
         special_tokens_dict["pad_token"] = DEFAULT_PAD_TOKEN
@@ -130,52 +229,30 @@ def train():
         model=model,
     )
 
-    # Load data the same way as train.py
-    logging.warning("Loading data...")
-    list_data_dict = jload(data_args.data_path)
+    # Load dataset
+    train_dataset = load_dataset_from_json(data_args.data_path)
     
-    # Format inputs the same way as train.py
-    logging.warning("Formatting inputs...")
-    prompt_input, prompt_no_input = PROMPT_DICT["prompt_input"], PROMPT_DICT["prompt_no_input"]
-    
-    # Build complete texts for SFTTrainer
-    formatted_texts = []
-    for example in list_data_dict:
-        # Generate prompt using the same logic as train.py
-        if example.get("input", "") != "":
-            prompt = prompt_input.format_map(example)
-        else:
-            prompt = prompt_no_input.format_map(example)
-        
-        # Combine prompt with output and eos_token
-        full_text = prompt + example['output'] + tokenizer.eos_token
-        formatted_texts.append(full_text)
-    
-    # Convert to HuggingFace Dataset
-    train_dataset = HFDataset.from_dict({"text": formatted_texts})
-    
-    # Create response template for DataCollatorForCompletionOnlyLM
-    # This will help identify where the response starts
-    response_template = "### Response:"
-    
-    # Initialize data collator to only compute loss on completion tokens
+    # Create data collator for completion only
+    response_template = "### Response:\n"
     data_collator = DataCollatorForCompletionOnlyLM(
         response_template=response_template,
         tokenizer=tokenizer,
         mlm=False
     )
     
-    # Initialize SFTTrainer with DataCollatorForCompletionOnlyLM
+    # Configure SFTTrainer
     trainer = SFTTrainer(
         model=model,
-        processing_class=tokenizer,
         args=training_args,
         train_dataset=train_dataset,
-        eval_dataset=None,
+        formatting_func=lambda x: formatting_prompts_func(x, tokenizer),
         data_collator=data_collator,
     )
     
+    # Train
     trainer.train()
+    
+    # Save
     trainer.save_state()
     trainer.save_model(output_dir=training_args.output_dir)
 
