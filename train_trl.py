@@ -233,13 +233,25 @@ def train():
     train_dataset = load_dataset_from_json(data_args.data_path)
     
     # Create data collator for completion only
+    '''
     response_template = "### Response:\n"
     data_collator = DataCollatorForCompletionOnlyLM(
         response_template=response_template,
         tokenizer=tokenizer,
         mlm=False
     )
+    '''
     
+    # https://huggingface.co/docs/trl/v0.9.6/sft_trainer
+	response_template_with_context = "\n### Response:\n"  # We added context here: "\n". This is enough for this tokenizer
+	response_template_ids = tokenizer.encode(response_template_with_context, add_special_tokens=False)[2:]
+
+	data_collator = DataCollatorForCompletionOnlyLM(
+		response_template_ids,
+		tokenizer=tokenizer,
+		mlm=False
+	)
+       
     # Configure SFTTrainer
     trainer = SFTTrainer(
         model=model,
