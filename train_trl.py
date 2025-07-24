@@ -32,12 +32,12 @@ PROMPT_DICT = {
     "prompt_input": (
         "Below is an instruction that describes a task, paired with an input that provides further context. "
         "Write a response that appropriately completes the request.\n\n"
-        "### Instruction:\n{instruction}\n\n### Input:\n{input}\n\n### Response:\n"
+        "### Instruction:\n{instruction}\n\n### Input:\n{input}\n\n### Response:\n{response}"
     ),
     "prompt_no_input": (
         "Below is an instruction that describes a task. "
         "Write a response that appropriately completes the request.\n\n"
-        "### Instruction:\n{instruction}\n\n### Response:\n"
+        "### Instruction:\n{instruction}\n\n### Response:\n{response}"
     ),
 }
 
@@ -85,94 +85,61 @@ def smart_tokenizer_and_embedding_resize(
         output_embeddings[-num_new_tokens:] = output_embeddings_avg
 
 
-def formatting_prompts_func(examples: Dict[str, List], tokenizer: transformers.PreTrainedTokenizer) -> List[str]:
-    """Format the dataset for SFTTrainer."""
-    # Handle both single example and batched examples
-    if isinstance(examples["instruction"], str):
-        # Single example case
-        instruction = examples["instruction"]
-        input_text = examples.get("input", "")
-        output = examples["output"]
-        
-        if input_text:
-            prompt = PROMPT_DICT["prompt_input"].format_map({
-                "instruction": instruction,
-                "input": input_text
-            })
-        else:
-            prompt = PROMPT_DICT["prompt_no_input"].format_map({
-                "instruction": instruction
-            })
-        
-        # Tokenize prompt to check if we have room for output
-        prompt_tokens = tokenizer(prompt, truncation=False, return_tensors=None)
-        prompt_length = len(prompt_tokens["input_ids"])
-        
-        # Reserve space for output and EOS token
-        max_output_length = tokenizer.model_max_length - prompt_length - 1
-        
-        if max_output_length > 50:  # Ensure minimum output space
-            # Truncate output if needed
-            output_tokens = tokenizer(output, truncation=False, return_tensors=None)
-            if len(output_tokens["input_ids"]) > max_output_length:
-                # Truncate output to fit
-                truncated_output_ids = output_tokens["input_ids"][:max_output_length]
-                output = tokenizer.decode(truncated_output_ids, skip_special_tokens=True)
+class CustomSFTTrainer(SFTTrainer):
+    def training_step(self, *args, **kwargs):
+        step = self.state.global_step
+        if step == 0:
+            inputs = args[1] if len(args) > 1 else kwargs.get('inputs', None)
+
+            input_ids = inputs.get('input_ids', None)
+            labels = inputs.get('labels', None)
+            attention_mask = inputs.get('attention_mask', None)
+            print("\n\n\n")
+            print("[CustomSFTTrainer] input_id:", input_ids[0])
+            print("[CustomSFTTrainer] label:", labels[0])
+            print("[CustomSFTTrainer] attention_mask:", attention_mask[0])
             
-            text = prompt + output + tokenizer.eos_token
-            return text
-        else:
-            logging.warning(f"Skipping example - prompt too long ({prompt_length} tokens)")
-            # Return minimal valid example to avoid error
-            return "### Instruction:\nHello\n\n### Response:\nHi" + tokenizer.eos_token
-    else:
-        # Batched examples case
+            decoded = self.processing_class.convert_ids_to_tokens(input_ids[0])
+            print("[CustomSFTTrainer] input_id decoded:", decoded)
+            decoded = self.processing_class.decode(input_ids[0], skip_special_tokens=False)
+            print("[CustomSFTTrainer] input_id decoded:", decoded)
+
+            label = torch.where(labels[0] == -100, torch.tensor(self.processing_class.pad_token_id, device=labels.device), labels[0])
+            decoded = self.processing_class.convert_ids_to_tokens(label)
+            print("[CustomSFTTrainer] label decoded:", decoded)
+            decoded = self.processing_class.decode(label, skip_special_tokens=False)
+            print("[CustomSFTTrainer] label decoded:", decoded)
+            print("\n\n\n")
+
+        return super().training_step(*args, **kwargs)
+
+
+def formatting_prompts_func(examples):
         output_texts = []
-        prompt_input = PROMPT_DICT["prompt_input"]
-        prompt_no_input = PROMPT_DICT["prompt_no_input"]
-        
+
         for i in range(len(examples["instruction"])):
-            # Handle missing or empty input field
-            if "input" in examples and i < len(examples["input"]):
-                input_text = examples["input"][i] if examples["input"][i] else ""
-            else:
-                input_text = ""
-            
-            if input_text:
-                prompt = prompt_input.format_map({
-                    "instruction": examples["instruction"][i],
-                    "input": input_text
+            instruction = examples["instruction"][i]
+            input_text = examples["input"][i]
+            response = examples["output"][i]
+
+            if len(input_text) >= 2:
+                prompt_input = PROMPT_DICT['prompt_input']
+                prompt_input = prompt_input.format_map({
+                    "instruction": instruction,
+                    "input": input_text,
+                    "response": response
                 })
+
+                output_texts.append(prompt_input)
             else:
-                prompt = prompt_no_input.format_map({
-                    "instruction": examples["instruction"][i]
+                prompt_no_input = PROMPT_DICT['prompt_no_input']
+                prompt_no_input = prompt_no_input.format_map({
+                    "instruction": instruction,
+                    "response": response 
                 })
-            
-            # Tokenize prompt to check if we have room for output
-            prompt_tokens = tokenizer(prompt, truncation=False, return_tensors=None)
-            prompt_length = len(prompt_tokens["input_ids"])
-            
-            # Reserve space for output and EOS token
-            max_output_length = tokenizer.model_max_length - prompt_length - 1
-            
-            if max_output_length > 50:  # Ensure minimum output space
-                output = examples["output"][i]
-                # Truncate output if needed
-                output_tokens = tokenizer(output, truncation=False, return_tensors=None)
-                if len(output_tokens["input_ids"]) > max_output_length:
-                    # Truncate output to fit
-                    truncated_output_ids = output_tokens["input_ids"][:max_output_length]
-                    output = tokenizer.decode(truncated_output_ids, skip_special_tokens=True)
-                
-                text = prompt + output + tokenizer.eos_token
-                output_texts.append(text)
-            else:
-                logging.warning(f"Skipping example {i} - prompt too long ({prompt_length} tokens)")
-        
-        # Always return at least one valid example to avoid empty batch error
-        if not output_texts:
-            output_texts.append("### Instruction:\nHello\n\n### Response:\nHi" + tokenizer.eos_token)
-        
+
+                output_texts.append(prompt_no_input)
+
         return output_texts
 
 
@@ -198,9 +165,7 @@ def train():
     # Load model
     model = AutoModelForCausalLM.from_pretrained(
         model_args.model_name_or_path,
-        cache_dir=training_args.cache_dir,
-        torch_dtype=torch.float16 if torch.cuda.is_available() and training_args.fp16 else torch.float32,
-        device_map="auto" if torch.cuda.is_available() else None,
+        cache_dir=training_args.cache_dir
     )
 
     # Load tokenizer
@@ -233,31 +198,32 @@ def train():
     train_dataset = load_dataset_from_json(data_args.data_path)
     
     # Create data collator for completion only
-    '''
-    response_template = "### Response:\n"
+    # https://huggingface.co/docs/trl/v0.9.6/sft_trainer
+    response_template_with_context = "\n### Response:\n"  # We added context here: "\n". This is enough for this tokenizer
+    response_template_ids = tokenizer.encode(response_template_with_context, add_special_tokens=False)[2:]
     data_collator = DataCollatorForCompletionOnlyLM(
-        response_template=response_template,
+        response_template_ids,
         tokenizer=tokenizer,
         mlm=False
     )
-    '''
     
-    # https://huggingface.co/docs/trl/v0.9.6/sft_trainer
-	response_template_with_context = "\n### Response:\n"  # We added context here: "\n". This is enough for this tokenizer
-	response_template_ids = tokenizer.encode(response_template_with_context, add_special_tokens=False)[2:]
-
-	data_collator = DataCollatorForCompletionOnlyLM(
-		response_template_ids,
-		tokenizer=tokenizer,
-		mlm=False
-	)
-       
     # Configure SFTTrainer
+    """
     trainer = SFTTrainer(
         model=model,
         args=training_args,
         train_dataset=train_dataset,
         formatting_func=lambda x: formatting_prompts_func(x, tokenizer),
+        data_collator=data_collator,
+    )
+    """
+
+    trainer = CustomSFTTrainer(
+        model=model,
+        processing_class=tokenizer,
+        args=training_args,
+        train_dataset=train_dataset,
+        formatting_func=formatting_prompts_func,
         data_collator=data_collator,
     )
     
@@ -271,3 +237,4 @@ def train():
 
 if __name__ == "__main__":
     train()
+
