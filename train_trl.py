@@ -12,6 +12,7 @@
 #    See the License for the specific language governing permissions and
 #    limitations under the License.
 
+import os
 import logging
 from dataclasses import dataclass, field
 from typing import Dict, Optional, List
@@ -87,14 +88,16 @@ def smart_tokenizer_and_embedding_resize(
 
 class CustomSFTTrainer(SFTTrainer):
     def training_step(self, *args, **kwargs):
+        rank = int(os.environ['RANK'])
         step = self.state.global_step
-        if step == 0:
+
+        if rank == 0 and step == 0:
             inputs = args[1] if len(args) > 1 else kwargs.get('inputs', None)
 
             input_ids = inputs.get('input_ids', None)
             labels = inputs.get('labels', None)
             attention_mask = inputs.get('attention_mask', None)
-            print("\n\n\n")
+            print("\n\n\n-----------------------------------------------------------------------")
             print("[CustomSFTTrainer] input_id:", input_ids[0])
             print("[CustomSFTTrainer] label:", labels[0])
             print("[CustomSFTTrainer] attention_mask:", attention_mask[0])
@@ -162,13 +165,19 @@ def train():
     parser = transformers.HfArgumentParser((ModelArguments, DataArguments, TrainingArguments))
     model_args, data_args, training_args = parser.parse_args_into_dataclasses()
 
-    # Load model
+    print("-"*100)
+    print(model_args)
+    print("-"*100)
+    print(data_args)
+    print("-"*100)
+    print(training_args)
+    print("-"*100)
+
     model = AutoModelForCausalLM.from_pretrained(
         model_args.model_name_or_path,
         cache_dir=training_args.cache_dir
     )
 
-    # Load tokenizer
     tokenizer = AutoTokenizer.from_pretrained(
         model_args.model_name_or_path,
         cache_dir=training_args.cache_dir,
@@ -176,8 +185,6 @@ def train():
         padding_side="right",
         use_fast=False,
     )
-    
-    # Set special tokens
     special_tokens_dict = dict()
     if tokenizer.pad_token is None:
         special_tokens_dict["pad_token"] = DEFAULT_PAD_TOKEN
@@ -194,11 +201,10 @@ def train():
         model=model,
     )
 
-    # Load dataset
     train_dataset = load_dataset_from_json(data_args.data_path)
     
     # Create data collator for completion only
-    # https://huggingface.co/docs/trl/v0.9.6/sft_trainer
+    # https://huggingface.co/docs/trl/v0.9.6/sft_trainer : to handle LLAMA1 case
     response_template_with_context = "\n### Response:\n"  # We added context here: "\n". This is enough for this tokenizer
     response_template_ids = tokenizer.encode(response_template_with_context, add_special_tokens=False)[2:]
     data_collator = DataCollatorForCompletionOnlyLM(
@@ -227,14 +233,10 @@ def train():
         data_collator=data_collator,
     )
     
-    # Train
     trainer.train()
-    
-    # Save
-    trainer.save_state()
+    #trainer.save_state()
     trainer.save_model(output_dir=training_args.output_dir)
 
 
 if __name__ == "__main__":
     train()
-
