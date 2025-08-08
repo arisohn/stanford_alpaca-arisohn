@@ -23,6 +23,7 @@ import utils
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from trl import SFTTrainer, DataCollatorForCompletionOnlyLM, SFTConfig
 from datasets import Dataset
+from skeleton import _print, _pprint, CustomSFTTrainer
 
 IGNORE_INDEX = -100
 DEFAULT_PAD_TOKEN = "[PAD]"
@@ -86,6 +87,7 @@ def smart_tokenizer_and_embedding_resize(
         output_embeddings[-num_new_tokens:] = output_embeddings_avg
 
 
+"""
 class CustomSFTTrainer(SFTTrainer):
     def training_step(self, *args, **kwargs):
         rank = int(os.environ['RANK'])
@@ -115,6 +117,7 @@ class CustomSFTTrainer(SFTTrainer):
             print("\n\n\n")
 
         return super().training_step(*args, **kwargs)
+"""
 
 
 def formatting_prompts_func(examples):
@@ -164,14 +167,11 @@ def load_dataset_from_json(data_path: str) -> Dataset:
 def train():
     parser = transformers.HfArgumentParser((ModelArguments, DataArguments, TrainingArguments))
     model_args, data_args, training_args = parser.parse_args_into_dataclasses()
-
-    print("-"*100)
-    print(model_args)
-    print("-"*100)
-    print(data_args)
-    print("-"*100)
-    print(training_args)
-    print("-"*100)
+    
+    _print("-" * 100)
+    _print(model_args)
+    _print(data_args)
+    _print(training_args)
 
     model = AutoModelForCausalLM.from_pretrained(
         model_args.model_name_or_path,
@@ -235,8 +235,9 @@ def train():
     
     trainer.train()
     #trainer.save_state()
-    trainer.save_model(output_dir=training_args.output_dir)
+    trainer.save_model(output_dir=training_args.output_dir) # FSDP 때문에, 여기서 저장할때 에러가 발생하여 모델에 저장된 값이 이상할때가 있음 -> requirements_trl_fsdp_workaround.txt 를 사용하여 패키지 설치!
 
 
 if __name__ == "__main__":
     train()
+
